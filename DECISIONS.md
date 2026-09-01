@@ -194,3 +194,88 @@ Python SDK instead returns `isError: true` with `"Unknown tool: <name>"`. A clie
 follows the spec literally and only catches protocol errors would read a misspelt tool name
 as a failed call. `tests/test_protocol.py` pins down what we actually ship so a future SDK
 change is visible as a test failure rather than a silent behaviour swap.
+
+---
+
+## ADR-006 — Streamable HTTP under `2026-07-28`: sessions are gone
+**Date:** 2026-09-02 · **Status:** Accepted
+
+**Decision.** Add Streamable HTTP alongside stdio, targeting `2026-07-28` only for new
+behaviour, and run it **stateless**. stdio stays the default transport so the Day 1 Claude
+Code registration keeps working untouched.
+
+**The prep plan's Day 2 describes a transport that no longer exists.** It specifies "a
+single endpoint handling POST/GET/DELETE with `Mcp-Session-Id` session management" and
+resumability via `Last-Event-ID`. That was accurate for `2025-03-26`..`2025-11-25`. Revision
+`2026-07-28` carries an explicit breaking-change notice:
+
+| Prep plan (2025 revisions) | `2026-07-28` |
+|---|---|
+| POST / GET / DELETE on one endpoint | **POST only** — GET and DELETE are `405` with `Allow: POST` |
+| `Mcp-Session-Id` session management | **Protocol-level sessions removed** — do not mint or echo |
+| resumable via `Last-Event-ID` | not resumable |
+| server→client requests on the SSE stream | replaced by MRTR (`InputRequiredResult` → client retries with `inputResponses`) |
+| standalone GET stream for notifications | long-lived notifications come from a `subscriptions/listen` response stream |
+| — | `Mcp-Method` required on every request; `Mcp-Name` on `tools/call` / `prompts/get` / `resources/read` |
+| — | headers **MUST** be validated against the body → `400` + `-32020 HeaderMismatch` |
+| — | `Origin` **MUST** be validated (DNS-rebinding defence) |
+
+**Why the spec removed sessions, which is the part worth being able to say.** A session ID
+is server-side affinity. It forces either sticky routing or shared session state, so a
+horizontally scaled deployment pays for a concept the protocol never needed: every field a
+session carried (protocol version, client capabilities, client info) is per-request data,
+and `2026-07-28` moved it into the request envelope under
+`params._meta["io.modelcontextprotocol/protocolVersion"]` and
+`.../clientCapabilities`. A self-contained POST load-balances to any replica, retries
+safely, and needs no eviction policy. The `initialize` handshake went for the same reason —
+it existed to establish the state that no longer exists. Deleting the handshake and deleting
+sessions are one change, not two.
+
+**The SDK enforces every transport MUST — verified by probe, not by reading.** `mcp` 2.1.1
+serving `MCPServer.streamable_http_app()`, driven through `httpx2.ASGITransport`:
+
+```
+GET /mcp                                    -> 405, Allow: POST
+DELETE /mcp                                 -> 405, Allow: POST
+Mcp-Method disagrees with body.method       -> 400, -32020
+Mcp-Method absent                           -> 400, -32020
+Mcp-Name disagrees with params.name         -> 400, -32020
+Mcp-Name absent on tools/call               -> 400, -32020
+MCP-Protocol-Version header != envelope     -> 400, -32020
+Mcp-Method sent twice (duplicate header)    -> 400, -32020
+params._meta envelope absent                -> 400, -32602
+unknown method                              -> 404, -32601
+Mcp-Session-Id sent on a modern request     -> 200, ignored, not echoed
+Origin: http://evil.example                 -> 403
+Host: evil.example                          -> 421
+```
+
+So the Phase 1 gate found **nothing to reimplement**. The header↔body ladder lives in
+`mcp/shared/inbound.py::classify_inbound_request`, the status mapping in
+`ERROR_CODE_HTTP_STATUS`, and `streamable_http_app(host="127.0.0.1")` auto-enables DNS
+rebinding protection with a localhost host/origin allowlist. These get *tested*, not
+duplicated — the tests are a regression guard on an SDK we do not control.
+
+**One gap, and it is a default rather than a missing feature.** Era routing is by header
+alone (`streamable_http_manager.py`): a POST whose `MCP-Protocol-Version` names a handshake
+revision — **or omits the header entirely** — is routed to the legacy stateful transport,
+which mints and echoes a session ID:
+
+```
+stateless_http=False  legacy initialize, no version header -> 200, Mcp-Session-Id=e3226cef…
+stateless_http=True   legacy initialize, no version header -> 200, Mcp-Session-Id=None
+stateless_http=True   modern tools/list                    -> 200, ok
+```
+
+An unconfigured server therefore reintroduces, on its back-compat path, the exact protocol
+feature `2026-07-28` deleted. **`stateless_http=True` closes it** with no middleware, and
+without dropping backward compatibility: legacy clients are still served, they just get no
+session. That is the honest posture — reach at no cost, which is the same finding ADR-002
+recorded for protocol versions — and it is why the "`Mcp-Session-Id` is never echoed" test
+is written against a header-less request, not only a modern one. A test that only probes
+the modern path would pass on a server that mints sessions all day.
+
+**Rejected: rejecting non-modern revisions over HTTP.** It would make "no sessions" true by
+construction rather than by configuration, but it discards clients the SDK serves correctly
+for free, and it makes this server stricter than the spec, which keeps back-compat
+deliberate. Statelessness gets the same guarantee at lower cost.

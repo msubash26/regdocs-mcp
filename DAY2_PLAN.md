@@ -86,20 +86,38 @@ Defaults already bind `127.0.0.1`, matching the spec's SHOULD. Most of today is 
 
 ## Phase 0 — Housekeeping · 15 min
 
-- [ ] `gh auth status` — it drifts back to `99Tungsten99`; switch to `msubash26` if needed
-- [ ] `./scripts/stack.sh ps` in the copilot — 7 services, only needed if tracing HTTP calls
-- [ ] Re-read Day 1's "Outcome" section in `DAY1_PLAN.md`
+- [x] `gh auth status` — already on `msubash26`, no switch needed this time
+- [x] `./scripts/stack.sh ps` in the copilot — 7 services up 46h, all healthy
+- [x] Re-read Day 1's "Outcome" section in `DAY1_PLAN.md`
 
 ## Phase 1 — Pin the transport delta · 30 min
 
 Research is already done (table above). Remaining:
 
-- [ ] Confirm against the installed SDK which of the `2026-07-28` transport MUSTs it
+- [x] Confirm against the installed SDK which of the `2026-07-28` transport MUSTs it
       actually enforces — specifically `Mcp-Method` / `Mcp-Name` presence and the
       header↔body validation producing `-32020`. **This is the gate:** anything the SDK does
       not enforce, we add as middleware, and anything it does enforce we test rather than
       duplicate.
-- [ ] Draft **ADR-006** — the transport delta and why sessions were removed
+- [x] Draft **ADR-006** — the transport delta and why sessions were removed
+
+### Phase 1 result — the gate is green, and it moved one Phase 2 item
+
+Probed `mcp` 2.1.1 through `httpx2.ASGITransport` rather than reading source. The SDK
+enforces **every** transport MUST: `405`+`Allow: POST` on GET/DELETE, `-32020` for a
+mismatched, absent or duplicated `Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`, `-32602`
+for a missing request envelope, `404`+`-32601` for an unknown method, `403`/`421` on a bogus
+`Origin`/`Host`. **Nothing to reimplement as middleware** — Phase 2 is the 90-minute shape.
+
+One gap, and it is a configuration default rather than a missing feature: era routing is by
+header alone, so a POST that *omits* `MCP-Protocol-Version` falls through to the legacy
+stateful transport and the server mints and echoes an `Mcp-Session-Id`. `stateless_http=True`
+closes it with no middleware and keeps legacy clients served. Recorded in ADR-006.
+
+Consequences for the phases below:
+- Phase 2 adds `stateless_http=True` — now a **correctness** requirement, not a tuning knob.
+- Phase 4's `Mcp-Session-Id` test must use a **header-less** request. Probing only the modern
+  path passes on a server that mints sessions on every legacy call.
 
 ## Phase 2 — Streamable HTTP transport · 90 min
 
