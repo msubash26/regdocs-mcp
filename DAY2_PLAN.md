@@ -224,19 +224,41 @@ have hit.
 HTTP-level tests via `httpx.ASGITransport` against `streamable_http_app()`, so they run in
 CI with no network and no live port.
 
-- [ ] `GET /mcp` and `DELETE /mcp` → `405` with `Allow: POST`
-- [ ] Bad `Origin` → `403`; permitted origin → passes
-- [ ] `Mcp-Session-Id` sent → ignored, and **not echoed back** (the regression that would
+- [x] `GET /mcp` and `DELETE /mcp` → `405` with `Allow: POST`
+- [x] Bad `Origin` → `403`; permitted origin → passes
+- [x] `Mcp-Session-Id` sent → ignored, and **not echoed back** (the regression that would
       silently reintroduce a removed protocol feature)
-- [ ] Missing token → `401` with a parseable `WWW-Authenticate` naming `resource_metadata`
-- [ ] Token with wrong `aud` → `401` (the confused-deputy case; the single most important
+- [x] Missing token → `401` with a parseable `WWW-Authenticate` naming `resource_metadata`
+- [x] Token with wrong `aud` → `401` (the confused-deputy case; the single most important
       auth test here)
-- [ ] Expired token → `401`; valid token, missing scope → `403` `insufficient_scope`
-- [ ] Valid token → `tools/list` returns the same four tools
-- [ ] `/.well-known/oauth-protected-resource/mcp` returns a valid RFC 9728 document
-- [ ] **Transport parity test:** the same server over stdio and over HTTP returns byte-identical
-      `tools/list` output. The Day 2 claim is "the same server runs both transports" — that
-      should be asserted by a test, not by a sentence in the README.
+- [x] Expired token → `401`; valid token, missing scope → `403` `insufficient_scope`
+- [x] Valid token → `tools/list` returns the same four tools
+- [x] `/.well-known/oauth-protected-resource/mcp` returns a valid RFC 9728 document
+- [x] **Transport parity test:** the same server over stdio and over HTTP returns byte-identical
+      `tools/list` output.
+
+### Phase 4 result
+
+`tests/test_http_transport.py` — **31 tests, suite now 90, all green**, no network and no
+live port (`httpx2.ASGITransport` against the same `http_app()` the process serves).
+
+The file separates two kinds of test on purpose, which is the Phase 1 gate written down as
+code: **guards on the SDK** (the header ladder, the 405, the Origin check — spec MUSTs the
+SDK already enforces, pinned so an upgrade that drops one fails here rather than in
+production) and **guards on our own code** (statelessness, the empty origin allowlist, every
+auth assertion).
+
+The parity test spawns a real `python -m regdocs_mcp` subprocess, feeds it one JSON-RPC line
+over stdio, and compares the serialised tool listing against the HTTP one — with a guard
+asserting four named tools first, so the comparison cannot pass on two empty listings.
+
+**One test failed on first run and taught us something the probe had not.** Era routing
+reads `MCP-Protocol-Version` *before* the classifier, so a value in the handshake set
+(2024-11-05..2025-11-25) is dispatched to the legacy transport and never reaches the modern
+header ladder — it cannot produce `-32020` no matter what the body envelope says. Only an
+*unrecognised* version routes modern. Both halves of that asymmetry are now pinned:
+`2026-01-01` mismatching the envelope → `400 -32020`; `2025-06-18` → legacy path, `200`, and
+still no session ID.
 
 ## Phase 5 — Docs and ship · 45 min
 

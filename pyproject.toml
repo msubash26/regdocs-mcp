@@ -28,6 +28,7 @@ dev = [
     "ruff>=0.8",
     "pre-commit>=4",
     "jsonschema>=4.26.0",
+    "httpx2>=0.1",
 ]
 
 [tool.ruff]
