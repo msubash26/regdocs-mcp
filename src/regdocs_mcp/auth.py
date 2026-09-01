@@ -32,7 +32,14 @@ from pydantic import AnyHttpUrl
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_SCOPE = "regdocs:read"
-DEFAULT_ISSUER = "http://127.0.0.1:9000"
+# RFC 2606 reserves `.invalid`, so this can never resolve. That is the point: there
+# is no authorization server here, and an operator who enables --auth without setting
+# $REGDOCS_AUTH_ISSUER should get an unambiguous DNS failure rather than a confusing
+# answer from whatever happens to be listening on a local port. A real client follows
+# the 401 challenge to this URL, so pointing it at a loopback port is worse than
+# useless — on this box :9000 is ClickHouse, and it answered a client's Dynamic Client
+# Registration attempt with "Port 9000 is for clickhouse-client program".
+DEFAULT_ISSUER = "https://auth.invalid"
 ALGORITHM = "HS256"
 
 SECRET_ENV = "REGDOCS_JWT_SECRET"

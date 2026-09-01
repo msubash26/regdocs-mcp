@@ -262,16 +262,41 @@ still no session ID.
 
 ## Phase 5 — Docs and ship · 45 min
 
-- [ ] **ADR-006** — Streamable HTTP under `2026-07-28`: no sessions, no GET stream, no
-      resumability, and why removing session state is the right call for a horizontally
-      scaled server
-- [ ] **ADR-007** — auth posture: resource server implemented, authorization server out of
-      scope, audience validation is the part that actually matters
-- [ ] README: HTTP quickstart, a `curl` example with the required headers, the security
-      posture, and `claude mcp add --transport http regdocs http://127.0.0.1:8000/mcp
-      --header "Authorization: Bearer ..."`
-- [ ] Verify Claude Code connects over HTTP as well as stdio
-- [ ] Commit, push, confirm CI green
+- [x] **ADR-006** — Streamable HTTP under `2026-07-28` (written in Phase 1)
+- [x] **ADR-007** — auth posture (written in Phase 3, amended in Phase 5)
+- [x] README: HTTP quickstart, a `curl` example with the required headers, the security
+      posture, and `claude mcp add --transport http`
+- [x] Verify Claude Code connects over HTTP as well as stdio
+- [x] Commit, push, confirm CI green
+
+### Phase 5 result
+
+README gains an **Over HTTP** section (runnable `curl` with the required headers, the auth
+walkthrough, the PRM document), a **Security posture** table, and a two-transport
+architecture diagram. Test count updated to 90.
+
+Both transports verified live in Claude Code, side by side:
+
+```
+regdocs:      uv run --directory .../regdocs-mcp regdocs-mcp   - ✔ Connected   (stdio)
+regdocs-http: http://127.0.0.1:8000/mcp (HTTP)                 - ✔ Connected   (bearer)
+```
+
+**The unauthenticated registration produced the best evidence of the day.** Registering the
+same URL *without* a token failed like this:
+
+```
+regdocs-http-noauth: ✘ Failed to connect — Dynamic Client Registration rejected
+  (HTTP 400): Port 9000 is for clickhouse-client program
+```
+
+That is the entire RFC 9728 chain executing correctly — `401` → read `WWW-Authenticate` →
+fetch protected-resource metadata → find `authorization_servers` → attempt registration —
+and it is proof the resource-server half works that curl could not have produced. It failed
+only because the placeholder issuer was `http://127.0.0.1:9000`, which on this box is the
+LangFuse stack's ClickHouse. **A loopback placeholder is worse than useless for an issuer,
+because a conforming client will dial it.** The default is now `https://auth.invalid`
+(RFC 2606 reserves `.invalid`, so it can never resolve). Recorded in ADR-007.
 
 ## Stretch — second server · only if Phases 0–5 finish early
 

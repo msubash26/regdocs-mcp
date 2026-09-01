@@ -315,8 +315,8 @@ under-scoped and bad-signature cases as *tokens* rather than as mocks.
 
 ```
 GET /.well-known/oauth-protected-resource/mcp
-  -> 200 {"resource":"http://127.0.0.1:8079/mcp",
-          "authorization_servers":["http://127.0.0.1:9000/"],
+  -> 200 {"resource":"http://127.0.0.1:8000/mcp",
+          "authorization_servers":["https://auth.invalid/"],
           "scopes_supported":["regdocs:read"],
           "bearer_methods_supported":["header"]}
 
@@ -343,8 +343,8 @@ attribute absent — not because it was assumed missing.
 
 *2. The published issuer and the accepted issuer disagreed by one character.* The RFC 9728
 document renders the issuer through pydantic's `AnyHttpUrl`, which appends a trailing slash
-to a path-less authority: configured `http://127.0.0.1:9000`, published
-`http://127.0.0.1:9000/`. RFC 8414 §2 makes issuer comparison *exact string comparison*, so
+to a path-less authority: configured `https://auth.invalid`, published
+`https://auth.invalid/`. RFC 8414 §2 makes issuer comparison *exact string comparison*, so
 a client that read `authorization_servers` from our own metadata and presented a token whose
 `iss` matched it verbatim would have been rejected by the server that published it. The
 verifier now accepts both spellings and only those two — one character wide, no prefix
@@ -358,6 +358,23 @@ three things and no more: `RS256` over a JWKS fetched from the issuer's metadata
 a shared secret, `issuer_url` pointed at the AS, and the dev minter deleted. The verifier's
 shape — signature, expiry, issuer, audience, scope — is unchanged, because that shape is
 what a resource server owes regardless of who issues the token.
+
+**The challenge chain works, and a real client proved it in a way curl could not.**
+Registering the server in Claude Code *without* a token produced not a bare failure but this:
+
+```
+regdocs-http-noauth: ✘ Failed to connect — Dynamic Client Registration rejected
+  (HTTP 400): Port 9000 is for clickhouse-client program
+```
+
+That is the whole RFC 9728 flow executing correctly: `401` → read `WWW-Authenticate` → fetch
+the protected-resource metadata → find `authorization_servers` → attempt registration
+against it. It failed only because the placeholder issuer was `http://127.0.0.1:9000`, and
+on this box port 9000 is the LangFuse stack's ClickHouse. A loopback placeholder is worse
+than useless for an issuer, because a conforming client *will* dial it. The default is now
+`https://auth.invalid` — RFC 2606 reserves `.invalid`, so it can never resolve, and an
+operator who enables `--auth` without setting `$REGDOCS_AUTH_ISSUER` gets an unambiguous DNS
+failure instead of an answer from whatever happens to be listening locally.
 
 **stdio never authenticates.** `--auth` with `--transport stdio` exits with an error rather
 than being ignored. A stdio server is a subprocess of its client and inherits that client's
