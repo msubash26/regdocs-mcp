@@ -4,10 +4,18 @@ This exists so the tool surface has real content to serve on Day 1. It is
 deliberately crude: PyMuPDF page text, split on MAS's numbered-clause
 convention. It does NOT handle tables, footnotes, or amendments-by-reference.
 
-Day 3 replaces this module with the Docling pipeline in `regops-ingest`, which
-writes the same three tables defined in `regdocs_mcp.index`. Nothing in
-`regdocs_mcp.server` imports from here — the schema is the contract, not the
-parser — so that swap should not touch the tools at all.
+Day 3 superseded this module for real use: `regops-ingest` now writes the same
+three tables with Docling, recovering 11,171 clauses against this module's
+8,055, plus 2,173 tables it flattens into text. Nothing in `regdocs_mcp.server`
+imports from here — the schema is the contract, not the parser — and that swap
+touched no tool, which `ingest/tests/test_contract.py` in the copilot pins.
+
+**Retained deliberately, still provisional.** Docling pulls 121 packages
+including torch and 15 CUDA wheels. Keeping this builder is what lets this repo
+stay independently cloneable and a `uv sync` from green CI: someone can build a
+usable index here without the copilot's heavy pipeline. Deleting it would make
+the standalone server depend on the workspace it is meant to be separable from
+(ADR-001, ADR-003). Use `regops-ingest` when content quality matters.
 
     regdocs-index build --corpus ../compliance-copilot/corpus --out regdocs.duckdb
 """

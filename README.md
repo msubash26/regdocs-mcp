@@ -155,13 +155,20 @@ what a compliance officer cites, and it survives re-parsing.
         ▲                 (DuckDB + FTS/BM25, located by --index or $REGDOCS_INDEX)
         │
    ┌────┴──────────────────────────┐
-   │ regdocs_mcp.build             │  Day 1, provisional: PyMuPDF + clause splitting
-   │ regops-ingest (Day 3)         │  replaces it — Docling, tables, contextual chunks
+   │ regdocs_mcp.build             │  provisional: PyMuPDF + clause splitting
+   │ regops-ingest (Day 3)         │  supersedes it — Docling, tables, contextual chunks
    └───────────────────────────────┘
 ```
 
 The server never imports the parser. The schema is the contract, so content quality can
-improve without a tool signature moving (ADR-003).
+improve without a tool signature moving (ADR-003) — and on Day 3 it did: `regops-ingest`
+recovers 11,171 clauses to this builder's 8,055, plus 2,173 tables, with **no edit to any
+tool**. The copilot's `ingest/tests/test_contract.py` drives these four tools over JSON-RPC
+against an index that pipeline built, so the claim is a test rather than a sentence.
+
+`build.py` is retained deliberately. Docling needs 121 packages including torch and 15 CUDA
+wheels; keeping a light builder here is what lets this repo stay cloneable and CI-green on
+its own.
 
 ## Index scale
 
