@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import threading
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import duckdb
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from regdocs_mcp import __version__, index, obligations
@@ -37,11 +41,19 @@ from regdocs_mcp.models import (
     SectionResult,
 )
 
+if TYPE_CHECKING:
+    from starlette.applications import Starlette
+
 MAX_TOP_K = 50
 MAX_SECTION_CHARS = 8000
 DEFAULT_SECTION_CHARS = 4000
 OBLIGATIONS_PAGE = 50
 EXTRACTOR_ID = "rule-based/modal-verb@1"
+
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PATH = "/mcp"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 mcp = MCPServer(
     name="regdocs",
@@ -238,20 +250,104 @@ def diff_versions(doc_id: str, v1: str, v2: str) -> DiffResult:
     return DiffResult(doc_id=doc_id, title=doc["title"], v1=v1, v2=v2, changes=[], total=0)
 
 
+def transport_security(host: str, allow_origins: Sequence[str] = ()) -> TransportSecuritySettings:
+    """DNS-rebinding settings for the HTTP transport (ADR-006).
+
+    Spec 2026-07-28 makes `Origin` validation a MUST. The SDK auto-enables its own
+    settings when the bind host is loopback, but that default allows any
+    `http://localhost:*` origin — on this box that includes the LangFuse UI on
+    :3000, so any page served there could drive the server from a browser. We pass
+    settings explicitly instead and start the origin allowlist **empty**: a
+    non-browser client (Claude Code, curl) sends no `Origin` at all and is
+    unaffected, and widening is a deliberate `--allow-origin`.
+
+    The host allowlist stays permissive on port so `--port` needs no second flag.
+    """
+    if host in _LOOPBACK_HOSTS:
+        # Bound to loopback, so accept whichever loopback name the client dialled.
+        hosts = [name for h in _LOOPBACK_HOSTS for name in (h, f"{h}:*")]
+    else:
+        hosts = [host, f"{host}:*"]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=list(allow_origins),
+    )
+
+
+def http_app(
+    *,
+    path: str = DEFAULT_HTTP_PATH,
+    host: str = DEFAULT_HTTP_HOST,
+    allow_origins: Sequence[str] = (),
+) -> Starlette:
+    """The Streamable HTTP ASGI app — same server, second transport.
+
+    `stateless_http=True` is a correctness requirement, not a tuning knob. Era
+    routing in the SDK is by header alone, so a POST that omits
+    `MCP-Protocol-Version` falls through to the legacy stateful transport, which
+    mints and echoes an `Mcp-Session-Id` — reintroducing the one feature spec
+    2026-07-28 deleted. Stateless serves those clients without a session. ADR-006.
+
+    Exposed as a factory so the tests can drive it over `httpx2.ASGITransport`
+    with no live port.
+    """
+    return mcp.streamable_http_app(
+        streamable_http_path=path,
+        stateless_http=True,
+        transport_security=transport_security(host, allow_origins),
+        host=host,
+    )
+
+
 def main() -> None:
-    """Console-script entry point. stdio transport; Streamable HTTP lands on Day 2.
+    """Console-script entry point: stdio (default) or Streamable HTTP.
+
+    stdio stays the default so an existing `claude mcp add` registration keeps
+    working untouched, and because stdio needs no running process. HTTP is opt-in
+    via `--transport http`.
 
     The index can be given as --index or as REGDOCS_INDEX. Both exist because
     hosts differ: Claude Code passes a declared `env` block through, while MCP
     Inspector spawns the server with a sanitised environment, so a server that
     can only be configured by environment variable is unreachable there.
     """
-    parser = argparse.ArgumentParser(prog="regdocs-mcp", description="regdocs MCP server (stdio)")
+    parser = argparse.ArgumentParser(
+        prog="regdocs-mcp",
+        description="regdocs MCP server — stdio and Streamable HTTP (spec 2026-07-28)",
+    )
     parser.add_argument(
         "--index",
         help=f"path to the DuckDB index (overrides ${index.DEFAULT_INDEX_ENV})",
     )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default="stdio",
+        help="transport to serve on (default: stdio)",
+    )
+    http = parser.add_argument_group("http transport (--transport http)")
+    http.add_argument(
+        "--host", default=DEFAULT_HTTP_HOST, help="bind address (default: %(default)s)"
+    )
+    http.add_argument(
+        "--port", type=int, default=DEFAULT_HTTP_PORT, help="bind port (default: %(default)s)"
+    )
+    http.add_argument(
+        "--path", default=DEFAULT_HTTP_PATH, help="endpoint path (default: %(default)s)"
+    )
+    http.add_argument(
+        "--allow-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "browser Origin permitted to call this server; repeatable. Empty by "
+            "default — non-browser clients send no Origin and do not need it."
+        ),
+    )
     args = parser.parse_args()
+
     if args.index:
         os.environ[index.DEFAULT_INDEX_ENV] = args.index
     if not os.environ.get(index.DEFAULT_INDEX_ENV):
@@ -259,4 +355,24 @@ def main() -> None:
             f"no index configured: pass --index PATH or set {index.DEFAULT_INDEX_ENV} "
             "(build one with: regdocs-index build --corpus <dir> --out regdocs.duckdb)"
         )
-    mcp.run(transport="stdio")
+
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+        return
+
+    if args.host not in _LOOPBACK_HOSTS:
+        # Spec 2026-07-28: servers SHOULD bind only localhost. Not refused — a
+        # container needs 0.0.0.0 — but it should never be silent.
+        print(
+            f"warning: binding {args.host}, not loopback. The spec's DNS-rebinding "
+            "guidance assumes localhost; put a reverse proxy in front and enable auth.",
+            file=sys.stderr,
+        )
+    mcp.run(
+        transport="streamable-http",
+        host=args.host,
+        port=args.port,
+        streamable_http_path=args.path,
+        stateless_http=True,
+        transport_security=transport_security(args.host, args.allow_origin),
+    )

@@ -121,16 +121,50 @@ Consequences for the phases below:
 
 ## Phase 2 — Streamable HTTP transport · 90 min
 
-- [ ] `regdocs-mcp --transport {stdio,http}`, with `--host`, `--port`, `--path` (default
+- [x] `regdocs-mcp --transport {stdio,http}`, with `--host`, `--port`, `--path` (default
       `/mcp`). stdio stays the default so Day 1's Claude Code registration keeps working
       untouched.
-- [ ] `TransportSecuritySettings` wired with a sane local default (`127.0.0.1` host allowlist,
+- [x] `TransportSecuritySettings` wired with a sane local default (`127.0.0.1` host allowlist,
       empty origin allowlist) and a `--allow-origin` flag for deliberate widening
-- [ ] Any header validation the Phase 1 gate showed missing, added as ASGI middleware
-- [ ] Manual verification against a live server: `POST /mcp` works; `GET /mcp` and
+- [x] ~~Any header validation the Phase 1 gate showed missing, added as ASGI middleware~~ —
+      **none was missing.** No middleware of our own; the SDK's enforcement is tested in
+      Phase 4 instead of duplicated.
+- [x] Manual verification against a live server: `POST /mcp` works; `GET /mcp` and
       `DELETE /mcp` return `405` with `Allow: POST`; a bogus `Origin` returns `403`; an
       `Mcp-Session-Id` header is ignored and not echoed; a mismatched `Mcp-Name` returns
       `-32020`
+
+### Phase 2 result
+
+`server.py` gains `transport_security()` and an `http_app()` factory (the factory so Phase 4
+drives the ASGI app with no live port), and `main()` grows the transport flags. 59 existing
+tests still green, ruff clean.
+
+Verified with `curl` against a live `uv run regdocs-mcp --transport http --port 8077`:
+
+```
+POST /mcp tools/list                        -> 200, four tools
+GET /mcp                                    -> 405, Allow: POST
+DELETE /mcp                                 -> 405, Allow: POST
+Origin: http://evil.example                 -> 403
+Origin: http://localhost:3000               -> 403   (SDK default would ALLOW this)
+Mcp-Name disagrees with params.name         -> 400, -32020
+Mcp-Session-Id on a modern request          -> 200, not echoed
+header-less legacy initialize               -> 200, not echoed  <- the ADR-006 fix
+--allow-origin http://localhost:3000, then Origin: http://localhost:3000 -> 200
+                                                  Origin: http://evil.example   -> 403
+```
+
+**One deliberate divergence from the SDK.** `streamable_http_app(host="127.0.0.1")`
+auto-enables DNS-rebinding protection but seeds the origin allowlist with
+`http://localhost:*`. On this box that includes LangFuse on :3000, so any page served there
+could drive the server from a browser. We pass settings explicitly and start the origin
+allowlist **empty** — non-browser clients (Claude Code, curl) send no `Origin` and are
+unaffected, and widening is an explicit `--allow-origin`. Line 5 above is that difference,
+measured.
+
+A non-loopback `--host` is not refused (a container needs `0.0.0.0`) but warns on stderr,
+since the spec's DNS-rebinding guidance assumes localhost.
 
 ## Phase 3 — Authorization, resource-server half · 90 min
 
