@@ -279,3 +279,92 @@ the modern path would pass on a server that mints sessions all day.
 construction rather than by configuration, but it discards clients the SDK serves correctly
 for free, and it makes this server stricter than the spec, which keeps back-compat
 deliberate. Statelessness gets the same guarantee at lower cost.
+
+---
+
+## ADR-007 — Auth posture: the resource-server half, done properly
+**Date:** 2026-09-02 · **Status:** Accepted
+
+**Decision.** Implement this server as an OAuth 2.1 **protected resource** and nothing else.
+Bearer tokens are signed JWTs, validated for signature, expiry, issuer, **audience** and
+scope. Authorization is **off by default**, opt-in with `--auth`, and rejected outright on
+stdio. No authorization server is implemented.
+
+**The prep plan's bar is below the spec's.** It says "a token check plus a written note on
+the OAuth flow is enough for a portfolio piece." Under `2026-07-28` authorization is optional
+overall, but a server that offers it MUST publish RFC 9728 metadata, challenge with `401` +
+`WWW-Authenticate`, validate the token audience per RFC 8707, and answer an under-scoped
+token with `403 insufficient_scope`. `if token == SECRET` is none of those, and the gap is
+not cosmetic — it is the whole of the security argument.
+
+**Audience validation is the part that matters, and the SDK does not do it.** The SDK
+verifies the `Bearer` scheme, calls our verifier, and enforces scopes. It never inspects
+`aud`. A resource server that accepts any correctly-signed token from its issuer — including
+one minted for a *different* resource — is a confused deputy: a token the user consented to
+give service A silently becomes a credential for service B. `jwt.decode(audience=...)` in
+`auth.py` is that check, the audience is this server's canonical URI
+(`http://host:port/mcp`), and it is the single most important line in the module.
+
+**Why a JWT verifier rather than a static bearer token.** A string compare is ~20 minutes
+cheaper and cannot demonstrate any of it: no audience binding, no expiry, no scope, no
+issuer. The JWT verifier is barely more code and makes each property real and testable.
+`mint_token()` stands in for the AS so the tests can construct the wrong-audience, expired,
+under-scoped and bad-signature cases as *tokens* rather than as mocks.
+
+**Measured on a live server** (`--transport http --port 8079 --auth`):
+
+```
+GET /.well-known/oauth-protected-resource/mcp
+  -> 200 {"resource":"http://127.0.0.1:8079/mcp",
+          "authorization_servers":["http://127.0.0.1:9000/"],
+          "scopes_supported":["regdocs:read"],
+          "bearer_methods_supported":["header"]}
+
+no token       -> 401 error="invalid_token"      + resource_metadata + scope
+valid          -> 200 tools/list
+wrong audience -> 401 error="invalid_token"      <- the confused-deputy case
+missing scope  -> 403 error="insufficient_scope"
+expired        -> 401 error="invalid_token"
+bad signature  -> 401 error="invalid_token"
+```
+
+Every rejection is deliberately indistinguishable to the caller: the SDK's `TokenVerifier`
+protocol has exactly one failure channel (`None`), and a verifier that explained *which*
+check failed would help an attacker enumerate.
+
+**Two things the probe found that reading would not have.**
+
+*1. The SDK's challenge omits the RFC 6750 `scope` attribute.* It emits `error`,
+`error_description` and `resource_metadata`. RFC 6750 §3.1 says a `403 insufficient_scope`
+SHOULD name the scope required, and a client that has to parse `error_description` prose to
+learn it is a client that will get it wrong. `ScopeChallengeMiddleware` appends it. This is
+the only middleware of our own in the stack, and it exists because a measurement showed the
+attribute absent — not because it was assumed missing.
+
+*2. The published issuer and the accepted issuer disagreed by one character.* The RFC 9728
+document renders the issuer through pydantic's `AnyHttpUrl`, which appends a trailing slash
+to a path-less authority: configured `http://127.0.0.1:9000`, published
+`http://127.0.0.1:9000/`. RFC 8414 §2 makes issuer comparison *exact string comparison*, so
+a client that read `authorization_servers` from our own metadata and presented a token whose
+`iss` matched it verbatim would have been rejected by the server that published it. The
+verifier now accepts both spellings and only those two — one character wide, no prefix
+matching, no case folding. Comparison stays exact; it is the set that has two members.
+
+**Deliberately not implemented, and what a real AS changes.** No `/authorize`, no `/token`,
+no dynamic client registration, no PKCE, no refresh, no consent screen, no revocation. Those
+belong to an authorization server — Keycloak, Auth0, Entra — and standing one up would
+demonstrate nothing this server is responsible for. Putting a real one in front changes
+three things and no more: `RS256` over a JWKS fetched from the issuer's metadata instead of
+a shared secret, `issuer_url` pointed at the AS, and the dev minter deleted. The verifier's
+shape — signature, expiry, issuer, audience, scope — is unchanged, because that shape is
+what a resource server owes regardless of who issues the token.
+
+**stdio never authenticates.** `--auth` with `--transport stdio` exits with an error rather
+than being ignored. A stdio server is a subprocess of its client and inherits that client's
+trust; the spec says stdio implementations SHOULD NOT use this flow and should take
+credentials from the environment. Silently accepting a flag that does nothing would be worse
+than refusing it.
+
+**HS256 keys are length-checked at construction.** RFC 7518 §3.2 requires an HMAC key at
+least as long as the hash output (32 bytes for SHA-256). PyJWT only warns, and a warning on
+stderr is not a control, so a short secret is refused with a message naming the fix.

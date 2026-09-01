@@ -168,21 +168,56 @@ since the spec's DNS-rebinding guidance assumes localhost.
 
 ## Phase 3 — Authorization, resource-server half · 90 min
 
-- [ ] A `TokenVerifier` implementation. **Recommendation: a signed-JWT verifier** that checks
-      signature, expiry, `aud` against this server's canonical URI, and `scope` — with the
-      signing key from the environment. It is barely more work than a string compare and it
-      makes audience validation real rather than gestured at.
-- [ ] `AuthSettings(issuer_url=..., resource_server_url=..., required_scopes=["regdocs:read"])`
-- [ ] Confirm the SDK serves `/.well-known/oauth-protected-resource/mcp` and that the
+- [x] A `TokenVerifier` implementation — signed-JWT verifier (`auth.py::JWTVerifier`)
+      checking signature, expiry, issuer, `aud` against this server's canonical URI, and
+      `scope`, with the signing key from `$REGDOCS_JWT_SECRET`.
+- [x] `AuthSettings(issuer_url=..., resource_server_url=..., required_scopes=["regdocs:read"])`
+- [x] Confirm the SDK serves `/.well-known/oauth-protected-resource/mcp` and that the
       document names the issuer and `scopes_supported`
-- [ ] `401` carries `WWW-Authenticate: Bearer resource_metadata="...", scope="regdocs:read"`
-- [ ] `403` + `error="insufficient_scope"` when the token is valid but under-scoped
-- [ ] Auth is **off by default and opt-in via `--auth`**. stdio must never require it — the
-      spec says stdio implementations SHOULD NOT use this flow and should take credentials
-      from the environment.
-- [ ] Write down what is deliberately *not* implemented: no authorization server, no
-      `/authorize`, no `/token`, no dynamic client registration, no PKCE — and what would
-      change if a real AS (Keycloak, Auth0) were put in front.
+- [x] `401` carries `WWW-Authenticate: Bearer resource_metadata="...", scope="regdocs:read"`
+      — the SDK omits `scope`, so `ScopeChallengeMiddleware` adds it
+- [x] `403` + `error="insufficient_scope"` when the token is valid but under-scoped
+- [x] Auth is **off by default and opt-in via `--auth`**; `--auth` on stdio exits with an
+      error rather than being silently ignored.
+- [x] Write down what is deliberately *not* implemented — ADR-007
+
+### Phase 3 result
+
+`auth.py`: `JWTVerifier`, `auth_settings()`, `ScopeChallengeMiddleware`, and a dev-only
+`mint_token()` exposed as `python -m regdocs_mcp.auth` so the README's curl example is
+runnable and the tests can build the failure cases as real tokens. `pyjwt>=2.10` added.
+
+Measured on a live server (`--transport http --port 8079 --auth`):
+
+```
+GET /.well-known/oauth-protected-resource/mcp -> 200, resource + issuer + scopes_supported
+no token       -> 401 error="invalid_token"      + resource_metadata + scope
+valid          -> 200 tools/list
+wrong audience -> 401 error="invalid_token"      <- the confused-deputy case
+missing scope  -> 403 error="insufficient_scope"
+expired        -> 401 error="invalid_token"
+bad signature  -> 401 error="invalid_token"
+```
+
+Refusal paths also verified: `--auth` on stdio, `--auth` with no secret, and a secret below
+RFC 7518's 32-byte HS256 minimum all exit with a one-line message naming the fix.
+
+**Two findings the probe produced that reading the SDK would not have** (both in ADR-007):
+
+1. The SDK's `WWW-Authenticate` omits the RFC 6750 `scope` attribute. `ScopeChallengeMiddleware`
+   adds it — the only middleware of our own, and it exists because a measurement showed the
+   attribute absent.
+2. **The published issuer and the accepted issuer disagreed by one character.** The RFC 9728
+   document renders the issuer through pydantic's `AnyHttpUrl`, which appends a trailing
+   slash to a path-less authority. RFC 8414 §2 makes issuer comparison exact, so a client
+   reading `authorization_servers` from our own metadata and presenting a token with that
+   exact `iss` would have been rejected by the server that published it. The verifier now
+   accepts both spellings and only those two.
+
+Also fixed while wiring: `http_app()` now resets `mcp.settings.auth` / `_token_verifier` on
+every call. `mcp` is a module-level singleton, so an authenticated call would otherwise have
+left auth on an app that asked for none — which Phase 4, running both in one process, would
+have hit.
 
 ## Phase 4 — Tests · 60 min
 

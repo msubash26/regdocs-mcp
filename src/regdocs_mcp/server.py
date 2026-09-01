@@ -32,6 +32,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from regdocs_mcp import __version__, index, obligations
+from regdocs_mcp import auth as auth_mod
 from regdocs_mcp.models import (
     DiffResult,
     ObligationOut,
@@ -279,7 +280,10 @@ def http_app(
     *,
     path: str = DEFAULT_HTTP_PATH,
     host: str = DEFAULT_HTTP_HOST,
+    port: int = DEFAULT_HTTP_PORT,
     allow_origins: Sequence[str] = (),
+    auth_secret: str | None = None,
+    auth_issuer: str = auth_mod.DEFAULT_ISSUER,
 ) -> Starlette:
     """The Streamable HTTP ASGI app — same server, second transport.
 
@@ -291,13 +295,37 @@ def http_app(
 
     Exposed as a factory so the tests can drive it over `httpx2.ASGITransport`
     with no live port.
+
+    Authorization is off unless `auth_secret` is given. When it is, this server
+    becomes an OAuth 2.1 protected resource: RFC 9728 metadata, a `401`
+    challenge naming it, and audience-validated bearer tokens (ADR-007).
     """
-    return mcp.streamable_http_app(
+    # Reset unconditionally: `mcp` is a module-level singleton, so a previous
+    # authenticated call would otherwise leave its settings on an app asked to be
+    # unauthenticated. The factory must depend only on its arguments.
+    mcp.settings.auth = None
+    mcp._token_verifier = None
+
+    if auth_secret is not None:
+        resource = auth_mod.resource_uri(host, port, path)
+        # MCPServer validates auth wiring in its constructor, and this module's
+        # server is built at import time with the tools attached — so auth, which
+        # is opt-in per invocation, is applied here. `streamable_http_app` reads
+        # both of these at call time.
+        mcp.settings.auth = auth_mod.auth_settings(issuer=auth_issuer, resource=resource)
+        mcp._token_verifier = auth_mod.JWTVerifier(
+            secret=auth_secret, issuer=auth_issuer, audience=resource
+        )
+
+    app = mcp.streamable_http_app(
         streamable_http_path=path,
         stateless_http=True,
         transport_security=transport_security(host, allow_origins),
         host=host,
     )
+    if auth_secret is not None:
+        app.add_middleware(auth_mod.ScopeChallengeMiddleware, scopes=[auth_mod.DEFAULT_SCOPE])
+    return app
 
 
 def main() -> None:
@@ -337,6 +365,15 @@ def main() -> None:
         "--path", default=DEFAULT_HTTP_PATH, help="endpoint path (default: %(default)s)"
     )
     http.add_argument(
+        "--auth",
+        action="store_true",
+        help=(
+            f"require an audience-validated bearer token (scope {auth_mod.DEFAULT_SCOPE}). "
+            f"Reads the signing secret from ${auth_mod.SECRET_ENV}. Off by default; "
+            "stdio never uses it."
+        ),
+    )
+    http.add_argument(
         "--allow-origin",
         action="append",
         default=[],
@@ -357,8 +394,24 @@ def main() -> None:
         )
 
     if args.transport == "stdio":
+        # Spec 2026-07-28: stdio implementations SHOULD NOT use the OAuth flow and
+        # should take credentials from the environment. --auth is HTTP-only.
+        if args.auth:
+            raise SystemExit(
+                "--auth applies to --transport http only. A stdio server is a "
+                "subprocess of its client and inherits that client's trust."
+            )
         mcp.run(transport="stdio")
         return
+
+    secret = None
+    if args.auth:
+        secret = os.environ.get(auth_mod.SECRET_ENV)
+        if not secret:
+            raise SystemExit(
+                f"--auth needs a signing secret: set {auth_mod.SECRET_ENV}. "
+                "Mint a matching dev token with: python -m regdocs_mcp.auth"
+            )
 
     if args.host not in _LOOPBACK_HOSTS:
         # Spec 2026-07-28: servers SHOULD bind only localhost. Not refused — a
@@ -368,11 +421,26 @@ def main() -> None:
             "guidance assumes localhost; put a reverse proxy in front and enable auth.",
             file=sys.stderr,
         )
-    mcp.run(
-        transport="streamable-http",
+    # Served through `http_app()` rather than `mcp.run(transport=...)` so the
+    # process serves byte-identical wiring to the one the tests drive.
+    import uvicorn
+
+    try:
+        app = http_app(
+            path=args.path,
+            host=args.host,
+            port=args.port,
+            allow_origins=args.allow_origin,
+            auth_secret=secret,
+            auth_issuer=os.environ.get(auth_mod.ISSUER_ENV, auth_mod.DEFAULT_ISSUER),
+        )
+    except ValueError as exc:
+        # Misconfiguration, not a crash — say so in one line and exit.
+        raise SystemExit(str(exc)) from exc
+
+    uvicorn.run(
+        app,
         host=args.host,
         port=args.port,
-        streamable_http_path=args.path,
-        stateless_http=True,
-        transport_security=transport_security(args.host, args.allow_origin),
+        log_level="info",
     )
