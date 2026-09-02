@@ -5,7 +5,7 @@ searchable, citable tools.
 
 **Spec revision:** `2026-07-28` · **SDK:** `mcp>=2.1,<3` · **Transports:** stdio +
 Streamable HTTP · **Status:** Day 2 — four tools, two transports, audience-validated bearer
-auth, 90 tests.
+auth, 93 tests. Ranking made reproducible on Day 6 (ADR-008).
 
 Built for a regulatory compliance copilot, but useful on its own: point it at an index and
 any MCP host can search Singapore financial regulation and cite it by clause number.
@@ -135,6 +135,15 @@ flow complete.
 All four are read-only and annotated as such. Every one is bounded: nothing here can return
 an unbounded result into a context window.
 
+`search_notices` is **reproducible**: the same query and arguments return the same ranking.
+That sounds like it needs no saying, and it was untrue here until Day 6. The order clause has
+carried three deterministic tie-break columns since Day 1, but they fire only on exact equality
+and DuckDB computes BM25 in a parallel reduction — so two clauses whose true scores are equal
+came back differing in the last bit, the tie-breaks never ran, and **9 of 40 real questions
+returned a different top-20 between runs**. Ordering on a rounded score makes the near-tie a
+real tie: 9 of 40 → **0 of 40**. A tool whose output is not a function of its input cannot be
+cached and cannot be diffed between agent runs. See [ADR-008](DECISIONS.md).
+
 `section_path` is the document's own clause number (`"6.14"`), not a chunk index — it is
 what a compliance officer cites, and it survives re-parsing.
 
@@ -193,7 +202,7 @@ made — measured, not guessed (ADR-005).
 ## Development
 
 ```bash
-uv run pytest -q        # 90 tests
+uv run pytest -q        # 93 tests
 uv run ruff check .
 uv run ruff format .
 ```

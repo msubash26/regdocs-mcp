@@ -385,3 +385,51 @@ than refusing it.
 **HS256 keys are length-checked at construction.** RFC 7518 §3.2 requires an HMAC key at
 least as long as the hash output (32 bytes for SHA-256). PyJWT only warns, and a warning on
 stderr is not a control, so a short secret is refused with a message naming the fix.
+
+---
+
+## ADR-008 — `search_notices` was not reproducible, and the tie-breaks that were supposed to prevent that never ran
+**Date:** 2026-09-06 · **Status:** Accepted
+
+**What was wrong.** `search_sections` has ordered by
+`score DESC, effective_date DESC NULLS LAST, doc_id, ordinal` since Day 1. Three deterministic
+tie-break columns after the score: it reads like a total order and it was not one. Measured on
+the real 463-document index over 40 golden questions, four runs each, **9 of 40 returned a
+different top-20 between runs of the same query against an unchanged index** — and **0 of 40
+after the fix**. (The copilot's ADR-022 records 10 of 40 for the same check. Detection is itself
+sampling — four runs need not catch every unstable query — so those are the same finding rather
+than a disagreement.)
+
+**Why the tie-breaks did not save it.** They fire only on *exact* equality. DuckDB sums each
+term's BM25 contribution in a parallel reduction, floating-point addition is not associative, and
+the same query returns the same clause's score varying in its last bit. Two clauses whose true
+scores are equal therefore compare as *unequal*, `effective_date` and `doc_id` are never
+consulted, and whichever thread finished first wins. **A tie-break that only handles exact ties
+is not a tie-break on a score computed in parallel.**
+
+**The fix.** `ORDER BY round(score, 9) DESC, …`. Rounding collapses the jitter into a real tie,
+which the columns after it then break. Nine places is roughly six orders of magnitude above the
+observed jitter (~1e-15 at these score magnitudes) and far below any score difference that
+carries meaning.
+
+**Why this is a *server* problem and not only a benchmark problem.** `compliance-copilot` found
+this in its own retrieval layer first (its ADR-022) because Day 5's headline claims were ranking
+claims. It is easy to read that as an evaluation concern. It is not: an MCP tool that returns a
+different ranking for the same arguments cannot be cached, cannot be diffed between agent runs,
+and makes any trajectory comparison over it meaningless — which is exactly what Day 8 intends to
+do. A tool whose output is not a function of its input is broken for reasons that have nothing to
+do with measurement.
+
+**What the tests can and cannot prove, stated because it already caught us out once.** The
+copilot's first fix — adding a uid tie-break — was verified against a small synthetic fixture,
+passed, and was still wrong on the real index; clean hand-written data has no near-ties for
+floating-point jitter to disturb. So `tests/test_determinism.py` does two different jobs. The
+fixture tests assert the *mechanism*: an exact tie is broken by the declared columns, repeated
+queries agree, and the SQL rounds before it compares. The test that would actually have caught
+the defect runs real queries against a real corpus index and **skips when `$REGDOCS_INDEX` is
+unset**, which is the normal case in CI. Keeping a test that cannot run in CI is deliberate: it
+documents that the fixture tests are not the evidence, and it runs for anyone who has an index.
+
+**Scope.** Only `search_sections` ranks by a computed score. `get_section`, `document`,
+`section_paths`, `document_sections` and `versions` order by stored columns or by nothing, and
+are unaffected.

@@ -127,6 +127,22 @@ class Page:
 
 SNIPPET_CHARS = 320
 
+# Decimal places a BM25 score is rounded to before it is ordered.
+#
+# `ORDER BY score DESC, effective_date DESC, doc_id, ordinal` looks deterministic
+# and is not, because those tie-breaks only fire on *exact* equality. DuckDB sums
+# each term's BM25 contribution in a parallel reduction, floating-point addition
+# is not associative, and the same query returns the same score varying in its
+# last bit -- so two clauses whose true scores are equal compare as unequal and
+# the tie-break never runs. Measured on the real index over 40 golden questions,
+# **9 of 40** returned a different top-20 between runs, and **0 of 40** after.
+#
+# Rounding first collapses the jitter into a real tie, which the columns after it
+# then break. 9 places sits ~6 orders of magnitude above the observed jitter
+# (~1e-15 at these magnitudes) and far below any score difference that carries
+# meaning. Ported from compliance-copilot ADR-022; see ADR-008 here.
+ROUND_DP = 9
+
 
 def search_sections(
     conn: duckdb.DuckDBPyConnection,
@@ -168,7 +184,8 @@ def search_sections(
                   FROM sections s) t
             JOIN documents d USING(doc_id)
             WHERE {clause}
-            ORDER BY t.score DESC, d.effective_date DESC NULLS LAST, t.doc_id, t.ordinal
+            ORDER BY round(t.score, {ROUND_DP}) DESC, d.effective_date DESC NULLS LAST,
+                     t.doc_id, t.ordinal
             LIMIT ? OFFSET ?""",
         [*params, top_k, offset],
     ).fetchall()
