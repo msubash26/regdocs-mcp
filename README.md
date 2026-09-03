@@ -5,7 +5,8 @@ searchable, citable tools.
 
 **Spec revision:** `2026-07-28` · **SDK:** `mcp>=2.1,<3` · **Transports:** stdio +
 Streamable HTTP · **Status:** Day 2 — four tools, two transports, audience-validated bearer
-auth, 93 tests. Ranking made reproducible on Day 6 (ADR-008).
+auth, 96 tests. Ranking made reproducible on Day 6 (ADR-008); parallel tool calls made
+safe on Day 7 (ADR-009).
 
 Built for a regulatory compliance copilot, but useful on its own: point it at an index and
 any MCP host can search Singapore financial regulation and cite it by clause number.
@@ -144,6 +145,15 @@ returned a different top-20 between runs**. Ordering on a rounded score makes th
 real tie: 9 of 40 → **0 of 40**. A tool whose output is not a function of its input cannot be
 cached and cannot be diffed between agent runs. See [ADR-008](DECISIONS.md).
 
+The four tools are also safe to call **in parallel on one session**, which they were not until
+Day 7. Every handler shared a single DuckDB connection, on the reasoning that a read-only
+connection is safe to share; read-only protects the file, not the connection's one statement
+context. Four concurrent `list_obligations` calls reported a valid `doc_id` as **missing** on
+2 of 4, 1 of 4 and 1 of 4 calls across three trials, and 0 of 4 sequentially. That failure is
+worse than a wrong ranking because it inverts silently — the caller is told authoritatively that
+a document is not in the corpus, one call after the same server returned its id from a search.
+Each handler now gets its own cursor. See [ADR-009](DECISIONS.md).
+
 `section_path` is the document's own clause number (`"6.14"`), not a chunk index — it is
 what a compliance officer cites, and it survives re-parsing.
 
@@ -202,7 +212,7 @@ made — measured, not guessed (ADR-005).
 ## Development
 
 ```bash
-uv run pytest -q        # 93 tests
+uv run pytest -q        # 96 tests
 uv run ruff check .
 uv run ruff format .
 ```

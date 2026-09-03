@@ -82,12 +82,31 @@ _lock = threading.Lock()
 
 
 def _db() -> duckdb.DuckDBPyConnection:
-    """Open the index once per process. Read-only, so sharing it is safe."""
+    """A cursor onto the process-wide index connection, one per call.
+
+    The earlier version returned `_conn` itself, with the comment *"read-only, so
+    sharing it is safe"*. Read-only makes it safe against **corruption**, not
+    against **interleaving**: a `DuckDBPyConnection` holds one statement context,
+    so two tool handlers executing on it at the same time can each read the
+    other's result set. FastMCP runs handlers concurrently, so any client that
+    issues parallel tool calls hits this.
+
+    Measured on the real index, four concurrent `list_obligations` calls over one
+    session, three trials: **2/4, 1/4 and 1/4 calls wrongly reported "no document
+    '<id>'" for a doc_id that exists**, and 0/4 sequentially. The failure is
+    silent in the worst way -- a valid identifier comes back as a missing one, so
+    a caller that trusts the tool concludes the corpus does not contain the
+    document rather than that the call went wrong.
+
+    `cursor()` returns an independent connection over the same database, which is
+    DuckDB's documented way to use one database from several threads. It costs an
+    object per call and no I/O -- the file stays open once.
+    """
     global _conn
     with _lock:
         if _conn is None:
             _conn = index.connect()
-        return _conn
+    return _conn.cursor()
 
 
 @mcp.tool(

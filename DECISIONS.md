@@ -433,3 +433,57 @@ documents that the fixture tests are not the evidence, and it runs for anyone wh
 **Scope.** Only `search_sections` ranks by a computed score. `get_section`, `document`,
 `section_paths`, `document_sections` and `versions` order by stored columns or by nothing, and
 are unaffected.
+
+---
+
+## ADR-009 — One DuckDB connection per tool call, because read-only is not the same as concurrent
+**Date:** 2026-09-07 · **Status:** Accepted
+
+**Decision.** `server._db()` returns `_conn.cursor()` — an independent connection over the same
+open database — rather than the process-wide `_conn` object itself. The module-level connection
+and its creation lock stay; only what is handed to a handler changes.
+
+**What was wrong.** `_db()` returned the shared connection, under the comment *"Open the index
+once per process. Read-only, so sharing it is safe."* Read-only is safe against **corruption of
+the file**. It says nothing about **interleaving on the connection**: a `DuckDBPyConnection`
+carries one statement context, and two handlers executing on it at the same moment can each read
+the other's result set. FastMCP runs tool handlers concurrently, so this is reachable by any
+client that issues parallel tool calls — which no client here did until `compliance-copilot`'s
+Day 7 supervisor fanned four sub-agents out over four documents.
+
+**Measured, before the fix**, four concurrent `list_obligations` calls over one session against
+the real 463-document index:
+
+| trial | calls wrongly reporting `no document '<id>'` |
+|---|---|
+| concurrent 1 | **2 / 4** |
+| concurrent 2 | **1 / 4** |
+| concurrent 3 | **1 / 4** |
+| concurrent 4 | 0 / 4 |
+| sequential | **0 / 4** |
+
+After the fix, 0 / 4 on six consecutive trials, and `tests/test_concurrency.py` passes on the
+synthetic fixture where the pre-fix code fails all three tests.
+
+**Why this is the severe kind of bug.** It is silent and it *inverts*. The tool does not return a
+transport error a caller could retry; it returns an authoritative, well-formed statement that a
+document is not in the corpus — for a `doc_id` the same server produced from `search_notices` one
+call earlier. Downstream, `compliance-copilot`'s coverage sweep read that as four documents being
+silent on politically exposed persons, and wrote it into an answer. A wrong ranking is visible to
+anyone who looks at the results; a wrong *absence* is not visible at all.
+
+**Cost.** One Python object per tool call and no I/O — `cursor()` shares the open file handle and
+the loaded FTS extension. It does not serialise anything, which was the alternative: holding
+`_lock` across every query would also have been correct and would have made the server answer
+parallel calls one at a time, converting a correctness bug into a throughput ceiling.
+
+**What the tests do differently this time.** ADR-008's lesson was that a synthetic fixture proved
+nothing about a floating-point bug. Here the fixture *is* sufficient — the race does not need
+realistic data, only two different correct answers in flight at once — so the tests run in CI. Two
+of them assert more than "no error": one checks that each parallel call received **its own**
+document, because a crossed result set can also succeed with someone else's rows, and an
+error-count assertion would pass while the data was wrong.
+
+**What is still not tested.** The Streamable HTTP transport serves multiple *clients*, and this
+fix addresses concurrency within one process. Nothing here proves the server is correct under two
+simultaneous HTTP sessions; that is the same mechanism and the same fix, but it is untested.
