@@ -109,6 +109,29 @@ def _db() -> duckdb.DuckDBPyConnection:
     return _conn.cursor()
 
 
+def _offset(cursor: str | None) -> int:
+    """`index.decode_cursor`, with its error delivered where a model can read it.
+
+    `decode_cursor` raises a plain `ValueError` whose message already names the
+    recovery path -- *"malformed cursor 'page2'; pass back a nextCursor
+    verbatim"*. It lands as an **unexpected exception**, and FastMCP withholds an
+    unexpected exception's message from the client, so what the model actually
+    received was `Error executing tool list_obligations`. The sentence written to
+    rescue the caller never reached the caller.
+
+    Measured on Day 8: a single agent inventing `cursor="page2"` on a coverage
+    sweep got that bare string back three times and gave up. This is F16, and the
+    general form is worth more than the fix -- **an error message is only as good
+    as the channel that delivers it**, and the module docstring's own rule
+    ("recoverable failures must not use bare ValueError") could not be enforced
+    here because the raise is in another module.
+    """
+    try:
+        return index.decode_cursor(cursor)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
 @mcp.tool(
     annotations=READ_ONLY,
     description=(
@@ -141,7 +164,7 @@ def search_notices(
         doc_type=doc_type,
         date_from=date_from,
         top_k=top_k,
-        offset=index.decode_cursor(cursor),
+        offset=_offset(cursor),
     )
     return SearchResult(
         hits=[SearchHit(**h) for h in page.rows],
@@ -222,7 +245,7 @@ def list_obligations(doc_id: str, cursor: str | None = None) -> ObligationsResul
         for s in index.document_sections(conn, doc_id)
         for o in obligations.extract(s["section_path"], s["heading"], s["text"])
     ]
-    offset = index.decode_cursor(cursor)
+    offset = _offset(cursor)
     page = found[offset : offset + OBLIGATIONS_PAGE]
     consumed = offset + len(page)
     return ObligationsResult(

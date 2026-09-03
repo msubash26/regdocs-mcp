@@ -5,8 +5,9 @@ searchable, citable tools.
 
 **Spec revision:** `2026-07-28` · **SDK:** `mcp>=2.1,<3` · **Transports:** stdio +
 Streamable HTTP · **Status:** Day 2 — four tools, two transports, audience-validated bearer
-auth, 96 tests. Ranking made reproducible on Day 6 (ADR-008); parallel tool calls made
-safe on Day 7 (ADR-009).
+auth, 108 tests. Ranking made reproducible on Day 6 (ADR-008); parallel tool calls made
+safe on Day 7 (ADR-009); a recoverable error's recovery path made reachable on Day 8
+(ADR-010).
 
 Built for a regulatory compliance copilot, but useful on its own: point it at an index and
 any MCP host can search Singapore financial regulation and cite it by clause number.
@@ -154,6 +155,16 @@ worse than a wrong ranking because it inverts silently — the caller is told au
 a document is not in the corpus, one call after the same server returned its id from a search.
 Each handler now gets its own cursor. See [ADR-009](DECISIONS.md).
 
+An error a caller can fix now **reaches** that caller, which is a different claim from the
+one this README made before. Every recoverable failure has always been raised as the SDK's
+`ToolError` so its message lands as `isError: true` with the recovery path attached — the valid
+section paths, the available versions. Two paging call sites did not: they let
+`decode_cursor`'s `ValueError` escape, and FastMCP withholds an *unexpected* exception's message
+from the client. So a model that invented `cursor="page2"` received `Error executing tool
+list_obligations` and nothing else, three times, while the sentence written to rescue it —
+*"malformed cursor 'page2'; pass back a nextCursor verbatim"* — went to a local log. An error
+message is only as good as the channel that delivers it. See [ADR-010](DECISIONS.md).
+
 `section_path` is the document's own clause number (`"6.14"`), not a chunk index — it is
 what a compliance officer cites, and it survives re-parsing.
 
@@ -212,7 +223,7 @@ made — measured, not guessed (ADR-005).
 ## Development
 
 ```bash
-uv run pytest -q        # 96 tests
+uv run pytest -q        # 108 tests
 uv run ruff check .
 uv run ruff format .
 ```

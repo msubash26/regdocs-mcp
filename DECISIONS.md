@@ -487,3 +487,44 @@ error-count assertion would pass while the data was wrong.
 **What is still not tested.** The Streamable HTTP transport serves multiple *clients*, and this
 fix addresses concurrency within one process. Nothing here proves the server is correct under two
 simultaneous HTTP sessions; that is the same mechanism and the same fix, but it is untested.
+
+---
+
+## ADR-010 — A recoverable error must be raised where the client can read it
+**Date:** 2026-09-08 · **Status:** Accepted · **Amends:** ADR-005's error rule
+
+**Decision.** Every call to `index.decode_cursor` goes through `server._offset`, which converts its
+`ValueError` into a `ToolError`. A test asserts the client receives the recovery sentence rather
+than a masked crash (`tests/test_cursor_errors.py`).
+
+**What was wrong.** `decode_cursor` raises `ValueError("malformed cursor 'page2'; pass back a
+nextCursor verbatim")` — a message written specifically to tell a caller how to recover. FastMCP
+passes a `ToolError`'s text through verbatim and **withholds an unexpected exception's message**,
+so what a client actually received was:
+
+```
+TOOL ERROR from list_obligations: Error executing tool list_obligations
+```
+
+Three times in a row, on `compliance-copilot`'s Day 8 eval, to a single agent that had invented
+`cursor="page2"` on a coverage sweep. It then stopped. The sentence written to rescue it was
+produced, logged locally with a full traceback, and never sent.
+
+**Why this is worth an ADR rather than a one-line fix.** This module's own docstring already
+carried the rule, in these words: *"recoverable failures must not use bare ValueError/LookupError"*.
+It shipped anyway, and the reason is structural: **the `raise` is in `index.py` and the rule binds
+`server.py`.** A convention stated in one module cannot be enforced in another, and the two call
+sites that violated it were one token different from the ones that did not
+(`index.decode_cursor(cursor)` against `raise ToolError(...)` three lines above). The general form —
+**an error message is only as good as the channel that delivers it** — is the part that transfers,
+and it is F16 in `compliance-copilot/FAILURE_MODES.md`.
+
+**Why not make `decode_cursor` raise `ToolError` itself.** `index.py` is the query layer and knows
+nothing about MCP; importing the SDK's exception type into it to fix a delivery problem would put
+the transport in the wrong module and make the layer untestable without a server. The conversion
+belongs at the boundary, which is where `_offset` sits.
+
+**Cost.** One indirection per paging call site, and a rule that is still a convention for every
+*other* recoverable failure in this file — those all raise `ToolError` directly today, and nothing
+mechanical stops the next one from not doing so. The honest mitigation is the test, which asserts
+the channel rather than the message and would fail the same way for any tool that regressed.
